@@ -1,8 +1,11 @@
 /******************************************************************************
-* Vehicle data transmitter sketch for Freematics ONE with ESP8266 WIFI module
+* Reference sketch for a vehicle data feed for Freematics Hub
+* Works with Freematics ONE with ESP8266 WIFI module
+* Developed by Stanley Huang https://www.facebook.com/stanleyhuangyc
 * Distributed under BSD license
-* Visit http://freematics.com/products/freematics-one for more information
-* Written by Stanley Huang <support@freematics.com.au>
+* Visit http://freematics.com/hub/api for Freematics Hub API reference
+* Visit http://freematics.com/products/freematics-one for hardware information
+* To obtain your Freematics Hub server key, contact support@freematics.com.au
 * 
 * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
@@ -25,13 +28,18 @@
 #define STATE_OBD_READY 0x2
 #define STATE_GPS_READY 0x4
 #define STATE_MEMS_READY 0x8
-#define STATE_SLEEPING 0x20
+#define STATE_WIFI_READY 0x10
 #define STATE_CONNECTED 0x40
 
-static uint16_t lastUTC = 0;
-static uint8_t lastGPSDay = 0;
-static uint32_t nextConnTime = 0;
-static uint16_t connCount = 0;
+uint32_t nextConnTime = 0;
+uint16_t connCount = 0;
+byte accCount = 0; // count of accelerometer readings
+long accSum[3] = {0}; // sum of accelerometer data
+int accCal[3] = {0}; // calibrated reference accelerometer data
+byte deviceTemp = 0; // device temperature
+int lastSpeed = 0;
+uint32_t lastSpeedTime = 0;
+uint32_t distance = 0;
 
 typedef enum {
     WIFI_DISCONNECTED = 0,
@@ -50,6 +58,10 @@ typedef enum {
 class COBDWIFI : public COBDSPI {
 public:
     COBDWIFI():wifiState(WIFI_DISCONNECTED),connErrors(0) { buffer[0] = 0; }
+    void resetWifi()
+    {
+      sendWifiCommand("AT+RST\r\n");
+    }
     void disconnectWifi()
     {
       sendWifiCommand("AT+CWQAP\r\n");
@@ -57,7 +69,6 @@ public:
     bool initWifi()
     {
       // set xBee module serial baudrate
-      xbBegin(9600);
       bool success = false;
       // test the module by issuing AT command and confirming response of "OK"
       for (byte n = 0; !(success = sendWifiCommand("ATE0\r\n")) && n < 10; n++) {
@@ -75,14 +86,14 @@ public:
     bool setupWifi()
     {
       // generate and send AT command for joining AP
-      sprintf(buffer, "AT+CWJAP=\"%s\",\"%s\"\r\n", WIFI_SSID, WIFI_PASSWORD);
+      sprintf_P(buffer, PSTR("AT+CWJAP=\"%s\",\"%s\"\r\n"), WIFI_SSID, WIFI_PASSWORD);
       byte ret = sendWifiCommand(buffer, 10000, "OK");
       if (ret == 1) {
         // get IP address
-        if (sendWifiCommand("AT+CIFSR\r\n", 1000, "OK")) {
+        if (sendWifiCommand("AT+CIFSR\r\n", 1000, "OK") && !strstr(buffer, "0.0.0.0")) {
           char *p = strchr(buffer, '\r');
           if (p) *p = 0;
-          Serial.print(buffer);
+          Serial.println(buffer);
           // output IP address
           return true;
         } else {
@@ -97,14 +108,14 @@ public:
     void httpClose()
     {
       sendWifiCommand("AT+CIPCLOSE\r\n", 1000, "Unlink");
-      Serial.println("DISCONNECTED");
+      Serial.println("TCP closed");
     }
     void httpConnect()
     {
-      Serial.println("CONNECTING");
       // start TCP connection
-      sprintf(buffer, "AT+CIPSTART=\"TCP\",\"%s\",%d\r\n", SERVER_URL, SERVER_PORT);
+      sprintf_P(buffer, PSTR("AT+CIPSTART=\"TCP\",\"%s\",%d\r\n"), SERVER_URL, SERVER_PORT);
       xbWrite(buffer);
+      Serial.print(buffer);
       // clear reception buffer
       buffer[0] = 0;
       bytesRecv = 0;
@@ -128,22 +139,23 @@ public:
         // not yet
         return false;
     }
-    bool httpSend(HTTP_METHOD method, const char* path, const char* payload = 0, int payloadSize = 0)
+    bool httpSend(HTTP_METHOD method, const char* path, bool keepAlive, const char* payload = 0, int payloadSize = 0)
     {
-      char header[128];
+      char header[192];
       char *p = header;
       // generate HTTP header
-      p += sprintf(p, "%s %s HTTP/1.1\r\nUser-Agent: Freematics\r\nConnection: keep-alive\r\n",
-      method == HTTP_GET ? "GET" : "POST", path, SERVER_URL);
+      p += sprintf_P(p, PSTR("%s %s HTTP/1.1\r\nUser-Agent: ONE\r\nHost: %s\r\nConnection: %s\r\n"),
+        method == HTTP_GET ? "GET" : "POST", path, SERVER_URL, keepAlive ? "keep-alive" : "close");
       if (method == HTTP_POST) {
-        p += sprintf(p, "Content-length: %u\r\n", payloadSize);
+        p += sprintf_P(p, PSTR("Content-length: %u\r\n"), payloadSize);
       }
-      p += sprintf(p, "\r\n");
+      p += sprintf_P(p, PSTR("\r\n"));
       // start TCP send
-      sprintf(buffer, "AT+CIPSEND=%u\r\n", (unsigned int)(p - header) + payloadSize);
+      sprintf_P(buffer, PSTR("AT+CIPSEND=%u\r\n"), (unsigned int)(p - header) + payloadSize);
       if (sendWifiCommand(buffer, 1000, ">")) {
         // send HTTP header
         xbWrite(header);
+        delay(50);
         // send POST payload if any
         if (payload) xbWrite(payload);
         buffer[0] = 0;
@@ -201,6 +213,7 @@ public:
     }
     bool sendWifiCommand(const char* cmd, unsigned int timeout = 2000, const char* expected = "OK")
     {
+      xbPurge();
       if (cmd) {
         xbWrite(cmd);
         delay(50);
@@ -215,105 +228,110 @@ public:
     byte connErrors;
 };
 
+
 class CTeleLogger : public COBDWIFI, public CDataLogger
+#if USE_MPU6050
+,public CMPU6050
+#elif USE_MPU9250
+,public CMPU9250
+#endif
 {
 public:
-    CTeleLogger():state(0),channel(0) {}
+    CTeleLogger():state(0),feedid(0) {}
     void setup()
     {
-        delay(500);
-        
-        // initialize hardware serial (for USB or BLE)
-        Serial.begin(115200);
-
         // this will init SPI communication
         begin();
-
-        // initialize OBD communication
-        Serial.print("#OBD..");
-        setTarget(TARGET_OBD);
-        do {
-            Serial.print('.');
-        } while (!init());
-        // display OBD firmware version
-        Serial.print("VER ");
-        Serial.println(version);
-        state |= STATE_OBD_READY;
-
-#if USE_MPU6050
+ 
+#if USE_MPU6050 || USE_MPU9250
         // start I2C communication 
         Wire.begin();
-        // initialize MPU-6050
         Serial.print("#MEMS...");
         if (memsInit()) {
+          state |= STATE_MEMS_READY;
           Serial.println("OK");
         } else {
           Serial.println("NO");
         }
 #endif
 
+        // initialize OBD communication
+        Serial.print("#OBD...");
+        if (init()) {
+          state |= STATE_OBD_READY;
+          Serial.println("OK");
+        } else {
+          Serial.println("NO");
+          reconnect();
+        }
+
 #if USE_GPS
         // start serial communication with GPS receive
+        Serial.print("#GPS...");
         if (initGPS(GPS_SERIAL_BAUDRATE)) {
           state |= STATE_GPS_READY;
-          Serial.println("#GPS...OK");
+          Serial.println("OK");
+        } else {
+          Serial.println("NO");
         }
 #endif
 
         // initialize ESP8266 xBee module (if present)
         Serial.print("#ESP8266...");
+        xbBegin(XBEE_BAUDRATE);
         if (initWifi()) {
-            Serial.println("OK");
+          state |= STATE_WIFI_READY;
+          Serial.println("OK");
         } else {
-            Serial.println(buffer);
+          Serial.println(buffer);
+          standby();
         }
 
         // attempt to join AP with pre-defined credential
         // make sure to change WIFI_SSID and WIFI_PASSWORD to your own ones
-        for (;;) {
+        for (byte n = 0; ;n++) {
           delay(100);
           Serial.print("#WIFI(SSID:");
           Serial.print(WIFI_SSID);
           Serial.print(")...");
           if (setupWifi()) {
-              Serial.print(' ');
-              Serial.println("OK");
               break;
           } else {
               Serial.println("NO");
+              if (n >= MAX_ERRORS_RECONNECT) standby();
           }
         }
         
         // connect with TeleServer (Freematics live data server)
         // will be stuck in the function if unsuccessful
-        joinChannel(0);
+        regDataFeed(0);
 
         Serial.println();
         delay(1000);
     }
-    void joinChannel(byte action)
+    void regDataFeed(byte action)
     {
-        // action == 0 for joining a channel
-        // action == 1 for leaving a channel
-#if ENABLE_DATA_CACHE
-      char *vin = cache;
-#else
-      char vin[240];
-#endif
+      // action == 0 for registering a data feed, action == 1 for de-registering a data feed
+
+      // retrieve VIN
+      char vin[20] = {0};
       if (action == 0) {
-        // get some info if it is about to joining a channel
-        setTarget(TARGET_OBD);
-        // retrieve VIN through OBD
-#if ENABLE_DATA_CACHE
-        getVIN(cache, MAX_CACHE_SIZE);
-#else
-        getVIN(vin, sizeof(vin));
-#endif
-        Serial.print("#VIN:");
-        Serial.println(vin);
+        // retrieve VIN
+        if (getVIN(buffer, sizeof(buffer))) {
+          strncpy(vin, buffer, sizeof(vin) - 1);
+          Serial.print("#VIN:");
+          Serial.println(vin);
+        }
+      } else {
+        if (feedid == 0) return; 
       }
+
       wifiState = WIFI_READY;
-      for (;;) {
+      for (byte n = 0; ;n++) {
+        // make sure OBD is still accessible
+        if (readSpeed() == -1) {
+          reconnect(); 
+        }
         // start a HTTP connection (TCP)
         httpConnect();
         do {
@@ -321,54 +339,62 @@ public:
           delay(200);
         } while (!httpIsConnected() && wifiState != WIFI_HTTP_ERROR);
         if (wifiState == WIFI_HTTP_ERROR) {
-          Serial.println("Unable to connect");
           Serial.println(buffer);
+          Serial.println("Unable to connect");
           httpClose();
-          delay(1000);
+          if (n >= MAX_ERRORS_RESET) {
+            standby();
+          }
+          delay(5000);
           wifiState = WIFI_READY;
           continue;
         }
 
         // generate HTTP URL
         if (action == 0) {
-          sprintf(buffer, "/push?VIN=%s", vin);
+          sprintf_P(buffer, PSTR("/%s/reg?vin=%s"), SERVER_KEY, vin);
         } else {
-          sprintf(buffer, "/push?id=%d&OFF=1", channel);
+          sprintf_P(buffer, PSTR("/%s/reg?id=%d&off=1"), SERVER_KEY, feedid);
         }
         
         // send HTTP request
-        if (!httpSend(HTTP_GET, buffer, 0)) {
-          Serial.println("Invalid response"); 
+        if (!httpSend(HTTP_GET, buffer, true) || !xbReceive(buffer, sizeof(buffer), MAX_CONN_TIME, "SEND OK")) {
+          Serial.println("Error sending");
           httpClose();
+          delay(3000);
           continue;
         }
 
-        if (action != 0) {
-            // no need for a response if leaving
-            return;
-        }
-        
-        // receive HTTP response
-        if (xbReceive(buffer, sizeof(buffer), MAX_CONN_TIME, "+IPD")) {
-          // grab the data we need from HTTP response payload
-          char *p = strstr(buffer, "CH:");
-          if (!p) {
-            // if not there, receive one more time
-            xbReceive(buffer, sizeof(buffer), MAX_CONN_TIME, "CH:");
-            p = strstr(buffer, "CH:");
+        delay(500);
+        // receive and parse response
+        xbReceive(buffer, sizeof(buffer), MAX_CONN_TIME, "\"id\"");
+        char *p = strstr(buffer, "\"id\"");
+        if (!p) {
+          if (!xbReceive(buffer, sizeof(buffer), MAX_CONN_TIME, "\"id\"")) {
+            httpClose();
+            delay(3000);
+            continue; 
           }
+        }
+        if (action == 0) {
+          // receive HTTP response
+          // grab the data we need from HTTP response payload
+          // parse feed ID
+          p = strstr(buffer, "\"id\"");
           if (p) {
-            // parse channel number
-            int m = atoi(p + 3);
+            int m = atoi(p + 5);
             if (m > 0) {
-              // keep the channel number needed for data pushing
-              channel = m;
-              Serial.print("#CHANNEL:");
-              Serial.println(m);
+              // keep the feed ID needed for data pushing
+              feedid = m;
+              Serial.print("#FEED ID:");
+              Serial.println(feedid);
               state |= STATE_CONNECTED;
               break;
             }
           }
+        } else {
+          httpClose();
+          break; 
         }
         Serial.println(buffer);
         httpClose();
@@ -378,66 +404,76 @@ public:
     void loop()
     {
         // the main loop
-        
-        // process OBD data if connected
-        if (state & STATE_OBD_READY) {
-          processOBD();
-        }
+        uint32_t start = millis();
+
+        if (state & STATE_CONNECTED) {
+          // process OBD data if connected
+          if (state & STATE_OBD_READY) {
+            processOBD();
+          }
+
+#if USE_MPU6050 || USE_MPU9250
+          // process MEMS data if available
+          if (state & STATE_MEMS_READY) {
+              processMEMS();  
+          }
+#endif
 
 #if USE_GPS
-        // process GPS data if connected
-        if (state & STATE_GPS_READY) {
-          processGPS();
-          delay(10);
-        }
+          // process GPS data if connected
+          if (state & STATE_GPS_READY) {
+            processGPS();
+          }
 #endif
-
-#if USE_MPU6050
-        // process accelerometer data if available
-        if (state & STATE_MEMS_READY) {
-            processMEMS();  
-        }
-#endif
-
-        if (millis() > nextConnTime) {
-          // process HTTP state machine
-          processHttp();
-        } else {
-#if ENABLE_DATA_LOG
-          flushData();
-#endif
+  
+          // read and log car battery voltage
+          int v = getVoltage() * 100;
+          logData(PID_BATTERY_VOLTAGE, v);
         }
 
-        // check if there are too many connection errors
-        if (connErrors >= MAX_CONN_ERRORS) {
-          // reset WIFI
-          Serial.println("Reset WIFI...");
-          httpClose();
-          disconnectWifi();
-          delay(1000);
-          setupWifi();
-          httpConnect();
-          connErrors = 0;
-          wifiState = WIFI_CONNECTING;          
-        }
+        do {
+          if (millis() > nextConnTime) {
+            // process HTTP state machine
+            processHttp();
+            // continously read speed for calculating trip distance
+            if (state & STATE_OBD_READY) {
+               readSpeed();
+            }
+            // error and exception handling
+            if (wifiState == WIFI_READY) {
+              if (errors > 10) {
+                reconnect();
+              } else if (deviceTemp >= COOLING_DOWN_TEMP) {
+                // device too hot, slow down communication a bit
+                Serial.print("Cool down (");
+                Serial.print(deviceTemp);
+                Serial.println("C)");
+                delay(5000);
+                break;
+              }
+            }          
+          }
+        } while (millis() - start < MIN_LOOP_TIME);
     }
 private:
     void processHttp()
     {
         // state machine for HTTP communications
+        nextConnTime = millis() + 200;
         switch (wifiState) {
         case WIFI_READY:
             // ready for doing next HTTP request
             if (cacheBytes > 0) {
               // and there is data in cache to send
-              sprintf(buffer, "/post?id=%u", channel);
+              sprintf_P(buffer, PSTR("/%s/post?id=%u"), SERVER_KEY, feedid);
               // send HTTP POST request with cached data as payload
-              if (httpSend(HTTP_POST, buffer, cache, cacheBytes)) {
+              if (httpSend(HTTP_POST, buffer, true, cache, cacheBytes)) {
                 // success
                 Serial.print("Sending ");
                 Serial.print(cacheBytes);
                 Serial.println(" bytes");
-                cacheBytes = 0;
+                //Serial.println(cache);
+                purgeCache();
                 wifiState = WIFI_SENDING;
               } else {
                 Serial.println("Request error");
@@ -451,24 +487,23 @@ private:
             httpConnect();
             wifiState = WIFI_CONNECTING;            
             connCount = 0;
-            nextConnTime = millis() + 100;
             break;
         case WIFI_CONNECTING:
             // in the progress of connecting
             if (httpIsConnected()) {
               wifiState = WIFI_READY;
+              state |= STATE_CONNECTED;
               break; 
             }
-            nextConnTime = millis() + 100;
             break;
         case WIFI_SENDING:
             // in the progress of data sending
             if (httpIsSent() || strstr(buffer, "+IPD")) {
               Serial.println("Sent");
+              connErrors = 0;
               wifiState = WIFI_RECEIVING;
               break; 
             }
-            nextConnTime = millis() + 100;
             break;
         case WIFI_RECEIVING:
             // in the progress of data receiving
@@ -481,26 +516,32 @@ private:
               if (connCount >= MAX_HTTP_CONNS) {
                 // re-establish TCP connection
                 httpClose(); 
-                nextConnTime = millis() + 500;
                 wifiState = WIFI_DISCONNECTED;
               } else {
                 wifiState = WIFI_READY;
               }
               break;
             }
-            nextConnTime = millis() + 200; 
             break;
         case WIFI_HTTP_ERROR:
             // oops, we got an error
             Serial.println(buffer);
-            if (connErrors >= 3) {
-              // if there are several consequent errors
-              // need to tear down TCP connection for reconnection
+            // check if there are too many connection errors
+            if (connErrors >= MAX_ERRORS_RECONNECT || strstr_P(buffer, PSTR("link is not"))) {
+              // reset WIFI
               httpClose();
-              nextConnTime = millis() + 500;
+              if (connErrors >= MAX_ERRORS_RESET) {
+                state &= ~STATE_CONNECTED;
+                Serial.println("Reset WIFI...");
+                disconnectWifi();
+                resetWifi();
+                delay(1000);
+                initWifi();
+                setupWifi();
+                connErrors = 0;
+              }
               wifiState = WIFI_DISCONNECTED;
             } else {
-              // otherwise just ignore some minor response errors
               wifiState = WIFI_READY;
             }
             break;
@@ -508,42 +549,52 @@ private:
     }
     void processOBD()
     {
-        // poll OBD-II PIDs
-        const byte pids[]= {PID_RPM, PID_SPEED, PID_ENGINE_LOAD, PID_THROTTLE};
+        int speed = readSpeed();
+        if (speed == -1) {
+          return;
+        }
+        logData(0x100 | PID_SPEED, speed);
+        logData(PID_TRIP_DISTANCE, distance);
+        // poll more PIDs
+        byte pids[]= {0, PID_RPM, PID_ENGINE_LOAD, PID_THROTTLE};
+        const byte pidTier2[] = {PID_INTAKE_TEMP, PID_COOLANT_TEMP};
+        static byte index2 = 0;
         int values[sizeof(pids)] = {0};
-        // read multiple OBD-II PIDs
-        byte results = read(pids, sizeof(pids), values);
+        // read multiple OBD-II PIDs, tier2 PIDs are less frequently read
+        pids[0] = pidTier2[index2 = (index2 + 1) % sizeof(pidTier2)];
+        byte results = readPID(pids, sizeof(pids), values);
         if (results == sizeof(pids)) {
           for (byte n = 0; n < sizeof(pids); n++) {
             logData(0x100 | pids[n], values[n]);
           }
         }
-        static byte index2 = 0;
-        const byte pidTier2[] = {PID_INTAKE_TEMP, PID_COOLANT_TEMP};
-        byte pid = pgm_read_byte(pidTier2 + index2);
+    }
+    int readSpeed()
+    {
         int value;
-        // read a single OBD-II PID
-        if (read(pid, value)) {
-          logData(0x100 | pid, value);
-        }
-        index2 = (index2 + 1) % sizeof(pidTier2);
-        if (errors > 10) {
-            reconnect();
+        if (readPID(PID_SPEED, value)) {
+           dataTime = millis();
+           distance += (value + lastSpeed) * (dataTime - lastSpeedTime) / 3600 / 2;
+           lastSpeedTime = dataTime;
+           lastSpeed = value;
+           return value;
+        } else {
+          return -1; 
         }
     }
-#if USE_MPU6050
+#if USE_MPU6050 || USE_MPU9250
     void processMEMS()
     {
-      if (state & STATE_MEMS_READY) {
-        MEMS_DATA mems;
-        // read accelerometer data
-        memsRead(&mems);
-        logData(PID_ACC, mems.value.x_accel / ACC_DATA_RATIO, mems.value.y_accel / ACC_DATA_RATIO, mems.value.z_accel / ACC_DATA_RATIO);
-      }
+         // log the loaded MEMS data
+        if (accCount) {
+          logData(PID_ACC, accSum[0] / accCount / ACC_DATA_RATIO, accSum[1] / accCount / ACC_DATA_RATIO, accSum[2] / accCount / ACC_DATA_RATIO);
+        }
     }
 #endif
     void processGPS()
     {
+        static uint16_t lastUTC = 0;
+        static uint8_t lastGPSDay = 0;
         GPS_DATA gd = {0};
         // read parsed GPS data
         if (getGPSData(&gd)) {
@@ -565,53 +616,119 @@ private:
             //Serial.print("#UTC:"); 
             //Serial.println(gd.time);
         } else {
-          Serial.println("GPS error");
-          delay(500);
+          Serial.println("No GPS data");
+          xbPurge();
         }
     }
     void reconnect()
     {
         // try to re-connect to OBD
-        if (init()) return; 
-        delay(3000);
-        if (init()) return; 
-        // seems we can't connect, put the device into sleeping mode
-        Serial.print("Sleeping");
-        state &= ~STATE_OBD_READY;
-        joinChannel(1); // leave channel
-        disconnectWifi(); // disconnect from AP
+        if (init()) return;
+        delay(1000);
+        if (init()) return;
+        standby();
+    }
+    void standby()
+    {
+        if (state & STATE_WIFI_READY) {
+          httpClose();
+          regDataFeed(1); // de-register
+          disconnectWifi(); // disconnect from AP
+          delay(500);
+          resetWifi();
+        }
 #if USE_GPS
         initGPS(0); // turn off GPS power
 #endif
-        Serial.println();
-        state |= STATE_SLEEPING;
-        // regularly check if we can get any OBD data
-        for (;;) {
-            int value;
-            if (read(PID_RPM, value))
-                break;
-            // put MCU into deep sleep mode for some time
-            sleep(4);
+        state &= ~(STATE_OBD_READY | STATE_GPS_READY | STATE_WIFI_READY | STATE_CONNECTED);
+        Serial.print("Standby");
+        // put OBD chips into low power mode
+        enterLowPowerMode();
+        // sleep for serveral seconds
+        for (byte n = 0; n < 30; n++) {
+          Serial.print('.');
+          readMEMS();
+          sleepms(250);
         }
-        // we are able to get OBD data again
-        // reset the device
+        calibrateMEMS();
+        for (;;) {
+          accSum[0] = 0;
+          accSum[1] = 0;
+          accSum[2] = 0;
+          for (accCount = 0; accCount < 10; ) {
+            readMEMS();
+            sleepms(30);
+          }
+          // calculate relative movement
+          unsigned long motion = 0;
+          for (byte i = 0; i < 3; i++) {
+            long n = accSum[i] / accCount - accCal[i];
+            motion += n * n;
+          }
+          // check movement
+          if (motion > START_MOTION_THRESHOLD) {
+            Serial.println(motion);
+            // try OBD reading
+            leaveLowPowerMode();
+            if (init()) {
+              // OBD is accessible
+              break;
+            }
+            enterLowPowerMode();
+            // calibrate MEMS again in case the device posture changed
+            calibrateMEMS();
+          }
+        }
+        // now we are able to get OBD data again
+        // reset device
         void(* resetFunc) (void) = 0; //declare reset function at address 0
         resetFunc();
     }
+    void calibrateMEMS()
+    {
+        // get accelerometer calibration reference data
+        accCal[0] = accSum[0] / accCount;
+        accCal[1] = accSum[1] / accCount;
+        accCal[2] = accSum[2] / accCount;
+    }
+    void readMEMS()
+    {
+        // load accelerometer and temperature data
+        int acc[3] = {0};
+        int temp; // device temperature (in 0.1 celcius degree)
+        memsRead(acc, 0, 0, &temp);
+        if (accCount >= 250) {
+          accSum[0] >>= 1;
+          accSum[1] >>= 1;
+          accSum[2] >>= 1;
+          accCount >>= 1;
+        }
+        accSum[0] += acc[0];
+        accSum[1] += acc[1];
+        accSum[2] += acc[2];
+        accCount++;
+        deviceTemp = temp / 10;
+    }
     void dataIdleLoop()
     {
-      delay(10);
+      // do something while waiting for data on SPI
+      if (state & STATE_MEMS_READY) {
+        readMEMS();
+      }
+      delay(20);
     }
-    
     byte state;
-    byte channel;
+    uint16_t feedid;
 };
 
 CTeleLogger logger;
 
 void setup()
 {
-    logger.initSender();
+    // initialize hardware serial (for USB and BLE)
+    Serial.begin(115200);
+    delay(500);
+    // perform initializations
     logger.setup();
 }
 

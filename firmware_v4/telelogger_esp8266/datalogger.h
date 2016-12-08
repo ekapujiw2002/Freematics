@@ -1,64 +1,18 @@
 /*************************************************************************
 * Telematics Data Logger Class
 * Distributed under BSD license
-* Written by Stanley Huang <stanleyhuangyc@gmail.com>
-* Visit http://freematics.com for more information
+* Developed by Stanley Huang https://www.facebook.com/stanleyhuangyc
 *************************************************************************/
 
-#define PID_GPS_LATITUDE 0xA
-#define PID_GPS_LONGITUDE 0xB
-#define PID_GPS_ALTITUDE 0xC
-#define PID_GPS_SPEED 0xD
-#define PID_GPS_HEADING 0xE
-#define PID_GPS_SAT_COUNT 0xF
-#define PID_GPS_TIME 0x10
-#define PID_GPS_DATE 0x11
-
-#define PID_ACC 0x20
-#define PID_GYRO 0x21
-#define PID_COMPASS 0x22
-#define PID_MEMS_TEMP 0x23
-#define PID_BATTERY_VOLTAGE 0x24
-
+// additional custom PID for data logger
 #define PID_DATA_SIZE 0x80
 
 #define FILE_NAME_FORMAT "/DAT%05d.CSV"
 #define ID_STR "#FREEMATICS"
 
-#if ENABLE_DATA_OUT
-
-#if defined(RF_SERIAL)
-#define SerialRF RF_SERIAL
-#else
-#define SerialRF Serial
-#endif
-
-#endif
-
 #if ENABLE_DATA_LOG
 static File sdfile;
 #endif
-
-typedef struct {
-    uint8_t pid;
-    char name[3];
-} PID_NAME;
-
-const PID_NAME pidNames[] PROGMEM = {
-{PID_ACC, {'A','C','C'}},
-{PID_GYRO, {'G','Y','R'}},
-{PID_COMPASS, {'M','A','G'}},
-{PID_GPS_LATITUDE, {'L','A','T'}},
-{PID_GPS_LONGITUDE, {'L','N','G'}},
-{PID_GPS_ALTITUDE, {'A','L','T'}},
-{PID_GPS_SPEED, {'S','P','D'}},
-{PID_GPS_HEADING, {'C','R','S'}},
-{PID_GPS_SAT_COUNT, {'S','A','T'}},
-{PID_GPS_TIME, {'U','T','C'}},
-{PID_GPS_DATE, {'D','T','E'}},
-{PID_BATTERY_VOLTAGE, {'B','A','T'}},
-{PID_DATA_SIZE, {'D','A','T'}},
-};
 
 class CDataLogger {
 public:
@@ -78,15 +32,17 @@ public:
     }
     byte genTimestamp(char* buf, bool absolute)
     {
-      byte n;
+      byte n = 0;
       if (absolute || dataTime >= m_lastDataTime + 60000) {
         // absolute timestamp
-        n = sprintf(buf, "#%lu", dataTime);
+        n = sprintf_P(buf, PSTR("#%lu"), dataTime);
       } else {
         // relative timestamp
-        n += sprintf(buf, "%u", (unsigned int)(dataTime - m_lastDataTime));
+        uint16_t elapsed = (unsigned int)(dataTime - m_lastDataTime);
+        if (elapsed) {
+          n = sprintf_P(buf, PSTR("%u"), elapsed);
+        }
       }
-      buf[n++] = ',';      
       return n;
     }
     void record(const char* buf, byte len)
@@ -94,6 +50,7 @@ public:
 #if ENABLE_DATA_LOG
         char tmp[12];
         byte n = genTimestamp(tmp, dataSize == 0);
+        tmp[n++] = ',';      
         dataSize += sdfile.write(tmp, n);
         dataSize += sdfile.write(buf, len);
         sdfile.println();
@@ -104,13 +61,38 @@ public:
     void dispatch(const char* buf, byte len)
     {
 #if ENABLE_DATA_CACHE
-        if (cacheBytes + len < MAX_CACHE_SIZE - 13) {
-          cacheBytes += genTimestamp(cache + cacheBytes, cacheBytes == 0);
+        // reserve some space for timestamp, ending white space and zero terminator
+        int l = cacheBytes + len + 12 - CACHE_SIZE;
+        if (l >= 0) {
+          // cache full
+#if CACHE_SHIFT
+          // discard the oldest data
+          for (l = CACHE_SIZE / 2; cache[l] && cache[l] != ' '; l++);
+          if (cache[l]) {
+            cacheBytes -= l;
+            memcpy(cache, cache + l + 1, cacheBytes);
+          } else {
+            cacheBytes = 0;  
+          }
+#else
+          return;        
+#endif
+        }
+        // add new data at the end
+        byte n = genTimestamp(cache + cacheBytes, cacheBytes == 0);
+        if (n == 0) {
+          // same timestamp 
+          cache[cacheBytes - 1] = ';';
+        } else {
+          cacheBytes += n;
+          cache[cacheBytes++] = ',';
+        }
+        if (cacheBytes + len < CACHE_SIZE - 1) {
           memcpy(cache + cacheBytes, buf, len);
           cacheBytes += len;
           cache[cacheBytes++] = ' ';
-          cache[cacheBytes] = 0;
         }
+        cache[cacheBytes] = 0;
 #else
         //char tmp[12];
         //byte n = genTimestamp(tmp, dataTime >= m_lastDataTime + 100);
@@ -137,7 +119,7 @@ public:
     {
         char buf[16];
         byte n = translatePIDName(pid, buf);
-        byte len = sprintf(buf + n, "%d", value) + n;
+        byte len = sprintf_P(buf + n, PSTR("%d"), value) + n;
         dispatch(buf, len);
         record(buf, len);
     }
@@ -145,7 +127,7 @@ public:
     {
         char buf[20];
         byte n = translatePIDName(pid, buf);
-        byte len = sprintf(buf + n, "%ld", value) + n;
+        byte len = sprintf_P(buf + n, PSTR("%ld"), value) + n;
         dispatch(buf, len);
         record(buf, len);
     }
@@ -153,7 +135,7 @@ public:
     {
         char buf[20];
         byte n = translatePIDName(pid, buf);
-        byte len = sprintf(buf + n, "%lu", value) + n;
+        byte len = sprintf_P(buf + n, PSTR("%lu"), value) + n;
         dispatch(buf, len);
         record(buf, len);
     }
@@ -161,7 +143,7 @@ public:
     {
         char buf[24];
         byte n = translatePIDName(pid, buf);
-        byte len = sprintf(buf + n, "%d,%d,%d", value1, value2, value3) + n;
+        byte len = sprintf_P(buf + n, PSTR("%d/%d/%d"), value1, value2, value3) + n;
         dispatch(buf, len);
         record(buf, len);
     }
@@ -169,7 +151,7 @@ public:
     {
         char buf[24];
         byte len = translatePIDName(pid, buf);
-        len += sprintf(buf + len, "%d.%06lu", (int)(value / 1000000), abs(value) % 1000000);
+        len += sprintf_P(buf + len, PSTR("%d.%06lu"), (int)(value / 1000000), abs(value) % 1000000);
         dispatch(buf, len);
         record(buf, len);
     }
@@ -182,7 +164,7 @@ public:
         dataSize = 0;
         if (SD.exists(filename)) {
             for (fileIndex = 1; fileIndex; fileIndex++) {
-                sprintf(filename + 9, FILE_NAME_FORMAT, fileIndex);
+                sprintf_P(filename + 9, PSTR(FILE_NAME_FORMAT), fileIndex);
                 if (!SD.exists(filename)) {
                     break;
                 }
@@ -192,7 +174,7 @@ public:
         } else {
             SD.mkdir(filename);
             fileIndex = 1;
-            sprintf(filename + 9, FILE_NAME_FORMAT, 1);
+            sprintf_P(filename + 9, PSTR(FILE_NAME_FORMAT), 1);
         }
 
         sdfile = SD.open(filename, FILE_WRITE);
@@ -214,23 +196,17 @@ public:
     uint32_t dataTime;
     uint32_t dataSize;
 #if ENABLE_DATA_CACHE
-    char cache[MAX_CACHE_SIZE];
+    void purgeCache()
+    {
+      cacheBytes = 0;
+    }
+    char cache[CACHE_SIZE];
     int cacheBytes;
 #endif
 private:
     byte translatePIDName(uint16_t pid, char* text)
     {
-#if USE_FRIENDLY_PID_NAME
-        for (uint16_t n = 0; n < sizeof(pidNames) / sizeof(pidNames[0]); n++) {
-            uint16_t id = pgm_read_byte(&pidNames[n].pid);
-            if (pid == id) {
-                memcpy_P(text, pidNames[n].name, 3);
-                text[3] = ',';
-                return 4;
-            }
-        }
-#endif
-        return sprintf(text, "%X,", pid);
+        return sprintf_P(text, PSTR("%X="), pid);
     }
     uint32_t m_lastDataTime;
 };

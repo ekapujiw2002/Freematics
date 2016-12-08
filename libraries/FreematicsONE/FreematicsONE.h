@@ -1,9 +1,12 @@
 /*************************************************************************
 * Arduino Library for Freematics ONE
-* Distributed under GPL v2.0
+* Distributed under BSD license
 * Visit http://freematics.com/products/freematics-one for more information
 * (C)2012-2016 Stanley Huang <stanleyhuangyc@gmail.com>
 *************************************************************************/
+
+#include "FreematicsMPU6050.h"
+#include "FreematicsMPU9250.h"
 
 #define OBD_TIMEOUT_SHORT 1000 /* ms */
 #define OBD_TIMEOUT_LONG 10000 /* ms */
@@ -71,6 +74,24 @@
 #define PID_ENGINE_TORQUE_PERCENTAGE 0x62
 #define PID_ENGINE_REF_TORQUE 0x63
 
+// non-OBD/custom PIDs (no mode number)
+#define PID_GPS_LATITUDE 0xA
+#define PID_GPS_LONGITUDE 0xB
+#define PID_GPS_ALTITUDE 0xC
+#define PID_GPS_SPEED 0xD
+#define PID_GPS_HEADING 0xE
+#define PID_GPS_SAT_COUNT 0xF
+#define PID_GPS_TIME 0x10
+#define PID_GPS_DATE 0x11
+#define PID_ACC 0x20
+#define PID_GYRO 0x21
+#define PID_COMPASS 0x22
+#define PID_MEMS_TEMP 0x23
+#define PID_BATTERY_VOLTAGE 0x24
+
+// custom PIDs for calculated data
+#define PID_TRIP_DISTANCE 0x30
+
 typedef enum {
     PROTO_AUTO = 0,
     PROTO_ISO_9141_2 = 3,
@@ -101,56 +122,6 @@ typedef struct {
     int16_t heading;
 } GPS_DATA;
 
-typedef union
-{
-  struct
-  {
-    uint8_t x_accel_h;
-    uint8_t x_accel_l;
-    uint8_t y_accel_h;
-    uint8_t y_accel_l;
-    uint8_t z_accel_h;
-    uint8_t z_accel_l;
-    uint8_t t_h;
-    uint8_t t_l;
-    uint8_t x_gyro_h;
-    uint8_t x_gyro_l;
-    uint8_t y_gyro_h;
-    uint8_t y_gyro_l;
-    uint8_t z_gyro_h;
-    uint8_t z_gyro_l;
-  } reg;
-  struct
-  {
-    int x_accel;
-    int y_accel;
-    int z_accel;
-    int temperature;
-    int x_gyro;
-    int y_gyro;
-    int z_gyro;
-  } value;
-} MEMS_DATA;
-
-#define MPU6050_I2C_ADDRESS 0x68
-#define MPU6050_ACCEL_XOUT_H       0x3B   // R
-#define MPU6050_ACCEL_XOUT_L       0x3C   // R
-#define MPU6050_ACCEL_YOUT_H       0x3D   // R
-#define MPU6050_ACCEL_YOUT_L       0x3E   // R
-#define MPU6050_ACCEL_ZOUT_H       0x3F   // R
-#define MPU6050_ACCEL_ZOUT_L       0x40   // R
-#define MPU6050_TEMP_OUT_H         0x41   // R
-#define MPU6050_TEMP_OUT_L         0x42   // R
-#define MPU6050_GYRO_XOUT_H        0x43   // R
-#define MPU6050_GYRO_XOUT_L        0x44   // R
-#define MPU6050_GYRO_YOUT_H        0x45   // R
-#define MPU6050_GYRO_YOUT_L        0x46   // R
-#define MPU6050_GYRO_ZOUT_H        0x47   // R
-#define MPU6050_GYRO_ZOUT_L        0x48   // R
-#define MPU6050_PWR_MGMT_1         0x6B   // R/W
-#define MPU6050_PWR_MGMT_2         0x6C   // R/W
-#define MPU6050_WHO_AM_I           0x75   // R
-
 uint16_t hex2uint16(const char *p);
 uint8_t hex2uint8(const char *p);
 
@@ -169,9 +140,11 @@ public:
 	// set SPI data target
 	void setTarget(byte target) { m_target = target; }
 	// receive data (up to 255 bytes) from SPI bus
-	int receive(char* buffer, int bufsize, int timeout = OBD_TIMEOUT_LONG);
+	int receive(char* buffer, int bufsize, int timeout = OBD_TIMEOUT_SHORT);
+	// read specified OBD-II PID value
+	bool readPID(byte pid, int& result);
 	// read multiple (up to 4) OBD-II PID value
-	byte read(const byte pid[], byte count, int result[]);
+	byte readPID(const byte pid[], byte count, int result[]);
 	// write data to SPI bus
 	void write(const char* s);
 	void write(byte* data, int len);
@@ -183,8 +156,11 @@ public:
 	bool getGPSData(GPS_DATA* gdata);
 	// get GPS NMEA data
 	byte getGPSRawData(char* buf, byte bufsize);
+	// send command string to GPS
+	void sendGPSCommand(const char* cmd);
 	// hardware sleep (timer counter will stop)
-	void sleep(uint8_t seconds);
+	void sleep(int seconds);
+	void sleepms(byte ms);
 	// start xBee UART communication
 	bool xbBegin(unsigned long baudrate = 115200L);
 	// read data to xBee UART
@@ -195,20 +171,16 @@ public:
 	byte xbReceive(char* buffer, int bufsize, int timeout = 1000, const char* expected1 = 0, const char* expected2 = 0);	
 	// purge xBee UART buffer
 	void xbPurge();
-	// initialize MEMS
-	bool memsInit();
-	// read out MEMS data
-	bool memsRead(MEMS_DATA* accel_t_gyro);
 	// initialize OBD-II connection
 	bool init(OBD_PROTOCOLS protocol = PROTO_AUTO);
 	// un-initialize OBD-II connection
 	void end();
 	// get connection state
 	OBD_STATES getState() { return m_state; }
-	// read specified OBD-II PID value
-	bool read(byte pid, int& result);
-	// put OBD chip into low power mode
-	void lowPowerMode();
+	// enter low power mode
+	void enterLowPowerMode();
+	// leave low power mode
+	void leaveLowPowerMode();
 	// set working protocol (default auto)
 	bool setProtocol(OBD_PROTOCOLS h = PROTO_AUTO);
 	// clear diagnostic trouble code
@@ -234,13 +206,10 @@ protected:
 	char* getResponse(byte& pid, char* buffer, byte bufsize);
 	void debugOutput(const char* s);
 	int normalizeData(byte pid, char* data);
-	virtual void dataIdleLoop() { delay(1); }
+	virtual void dataIdleLoop() { delay(10); }
 	OBD_STATES m_state;
 private:
 	byte getVersion();
-	bool MPU6050_read(int start, uint8_t *buffer, int size);
-	bool MPU6050_write(int start, const uint8_t *pData, int size);
-	bool MPU6050_write_reg(int reg, uint8_t data);
 	uint8_t getPercentageValue(char* data)
 	{
 		return (uint16_t)hex2uint8(data) * 100 / 255;

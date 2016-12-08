@@ -1,8 +1,8 @@
 /*************************************************************************
 * Arduino Library for Freematics ONE
-* Distributed under GPL v2.0
+* Distributed under BSD license
 * Visit http://freematics.com/products/freematics-one for more information
-* (C)2012-2016 Stanley Huang <stanleyhuangyc@gmail.com>
+* (C)2012-2016 Stanley Huang <support@freematics.com.au
 *************************************************************************/
 
 #include <Arduino.h>
@@ -67,15 +67,12 @@ byte hex2uint8(const char *p)
 void COBDSPI::sendQuery(byte pid)
 {
 	char cmd[8];
-	sprintf(cmd, "%02X%02X\r", dataMode, pid);
-#ifdef DEBUG
-	debugOutput(cmd);
-#endif
-       setTarget(TARGET_OBD);
+	sprintf_P(cmd, PSTR("%02X%02X\r"), dataMode, pid);
+    setTarget(TARGET_OBD);
 	write(cmd);
 }
 
-bool COBDSPI::read(byte pid, int& result)
+bool COBDSPI::readPID(byte pid, int& result)
 {
 	// send a single query command
 	sendQuery(pid);
@@ -213,7 +210,7 @@ bool COBDSPI::setProtocol(OBD_PROTOCOLS h)
 	if (h == PROTO_AUTO) {
 		write("ATSP00\r");
 	} else {
-		sprintf(buf, "ATSP%d\r", h);
+		sprintf_P(buf, PSTR("ATSP%d\r"), h);
 		write(buf);
 	}
 	if (receive(buf, sizeof(buf), OBD_TIMEOUT_LONG) > 0 && strstr(buf, "OK"))
@@ -222,11 +219,18 @@ bool COBDSPI::setProtocol(OBD_PROTOCOLS h)
 		return false;
 }
 
-void COBDSPI::lowPowerMode()
+void COBDSPI::enterLowPowerMode()
 {
 	char buf[32];
 	setTarget(TARGET_OBD);
 	sendCommand("ATLP\r", buf, sizeof(buf));
+}
+
+void COBDSPI::leaveLowPowerMode()
+{
+	// simply send any command to wake the device up
+	char buf[32];
+	sendCommand("ATI\r", buf, sizeof(buf), 100);
 }
 
 float COBDSPI::getVoltage()
@@ -234,7 +238,7 @@ float COBDSPI::getVoltage()
 	char buf[32];
 	setTarget(TARGET_OBD);
 	if (sendCommand("ATRV\r", buf, sizeof(buf)) > 0) {
-		return atof(buf);
+		return atof(buf + 4);
 	}
 	return 0;
 }
@@ -322,7 +326,7 @@ void COBDSPI::debugOutput(const char *s)
 	DEBUG.print('[');
 	DEBUG.print(millis());
 	DEBUG.print(']');
-	DEBUG.print(s);
+	DEBUG.println(s);
 }
 #endif
 
@@ -335,6 +339,9 @@ static const char PROGMEM targets[][4] = {
 
 byte COBDSPI::begin()
 {
+	// turn off ADC
+	ADCSRA &= ~(1 << ADEN);
+	
 	m_target = TARGET_OBD;
 	pinMode(SPI_PIN_READY, INPUT);
 	pinMode(SPI_PIN_CS, OUTPUT);
@@ -359,7 +366,7 @@ void COBDSPI::end()
 byte COBDSPI::getVersion()
 {
 	version = 0;
-       setTarget(TARGET_OBD);
+    setTarget(TARGET_OBD);
 	for (byte n = 0; n < 3; n++) {
 		write("ATI\r");
 		char buffer[64];
@@ -407,9 +414,19 @@ int COBDSPI::receive(char* buffer, int bufsize, int timeout)
 		if (eof) n--;
 	}
 	buffer[n] = 0;
-	if (m_target == TARGET_OBD && !memcmp(buffer, "$OBDTIMEOUT", 11)) {
-		// ECU not responding
-		return 0;
+	if (m_target == TARGET_OBD) {
+		if (!memcmp(buffer, "$OBDTIMEOUT", 11)) {
+			// ECU not responding
+#ifdef DEBUG
+			debugOutput("ECU TIMEOUT");
+#endif
+			return 0;
+		}
+#ifdef DEBUG
+		if (memcmp(buffer + 5, "NO DATA", 7)) {
+			debugOutput(buffer + 4);
+		}
+#endif
 	}
 	return n;
 }
@@ -448,27 +465,38 @@ void COBDSPI::write(byte* data, int len)
 	digitalWrite(SPI_PIN_CS, HIGH);
 }
 
-byte COBDSPI::read(const byte pid[], byte count, int result[])
+byte COBDSPI::readPID(const byte pid[], byte count, int result[])
 {
-	// send a multiple query command
-	char buffer[128];
-	char *p = buffer;
-	byte results = 0;
-	for (byte n = 0; n < count; n++) {
-		p += sprintf(p, "$OBD%02X%02X\r", dataMode, pid[n]);
-		if (version > 10) {
-			*(p++) = 0x1b;
-		}		
+	if (version > 10) {
+		// send a multiple query command
+		char buffer[128];
+		char *p = buffer;
+		byte results = 0;
+		for (byte n = 0; n < count; n++) {
+			p += sprintf_P(p, PSTR("$OBD%02X%02X\r"), dataMode, pid[n]);
+			if (version > 10) {
+				*(p++) = 0x1b;
+			}
+		}
+		*(p - 1) = 0;
+		write(buffer);
+		// receive and parse the response
+		for (byte n = 0; n < count; n++) {
+			byte curpid = pid[n];
+			if (getResult(curpid, result[n]))
+				results++;
+		}
+		return results;
 	}
-	*(p - 1) = 0;
-	write(buffer);
-	// receive and parse the response
-	for (byte n = 0; n < count; n++) {
-		byte curpid = pid[n];
-		if (getResult(curpid, result[n]))
-			results++;
+	else {
+		byte results = 0;
+		for (byte n = 0; n < count; n++) {
+			if (readPID(pid[n], result[n])) {
+				results++;
+			}
+		}
+		return results;
 	}
-	return results;
 }
 
 byte COBDSPI::sendCommand(const char* cmd, char* buf, byte bufsize, int timeout)
@@ -495,7 +523,7 @@ bool COBDSPI::initGPS(unsigned long baudrate)
 	m_target = TARGET_OBD;
 	if (baudrate) {
 		if (sendCommand("ATGPSON\r", buf, sizeof(buf))) {
-			sprintf(buf, "ATBR2%lu\r", baudrate);
+			sprintf_P(buf, PSTR("ATBR2%lu\r"), baudrate);
 			if (sendCommand(buf, buf, sizeof(buf))) {
 				delay(200);
 				if (getGPSRawData(buf, sizeof(buf)) && strstr(buf, "S$G")) {
@@ -573,22 +601,27 @@ byte COBDSPI::getGPSRawData(char* buf, byte bufsize)
 	return n;
 }
 
-void COBDSPI::sleep(uint8_t seconds) {
+void COBDSPI::sendGPSCommand(const char* cmd)
+{
+	setTarget(TARGET_GPS);
+	write(cmd);
+}
+
+
+void COBDSPI::sleepms(byte ms)
+{
 	uint8_t wdt_period;
-	switch (seconds) {
-	case 1:
-		wdt_period = WDTO_1S;
-		break;
-	case 2:
-		wdt_period = WDTO_2S;
-		break;
-	case 3:
-	case 4:
-		wdt_period = WDTO_4S;
-		break;
-	default:
-		wdt_period = WDTO_8S;
-	}
+	if (ms <= 15)
+		wdt_period = WDTO_15MS;
+	else if (ms <= 30)
+		wdt_period = WDTO_30MS;
+	else if (ms <= 60)
+		wdt_period = WDTO_60MS;
+	else if (ms <= 120)
+		wdt_period = WDTO_120MS;
+	else
+		wdt_period = WDTO_250MS;
+
 	wdt_enable(wdt_period);
 	wdt_reset();
 	WDTCSR |= _BV(WDIE);
@@ -598,13 +631,36 @@ void COBDSPI::sleep(uint8_t seconds) {
 	WDTCSR &= ~_BV(WDIE);
 }
 
+void COBDSPI::sleep(int seconds)
+{
+	enterLowPowerMode();
+	while (seconds > 0) {
+		uint8_t wdt_period; 
+		if (seconds >= 8) {
+			wdt_period = WDTO_8S;
+			seconds -= 8;
+		} else {
+			wdt_period = WDTO_1S;
+			seconds--;
+		}
+		wdt_enable(wdt_period);
+		wdt_reset();
+		WDTCSR |= _BV(WDIE);
+		set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+		sleep_mode();
+		wdt_disable();
+		WDTCSR &= ~_BV(WDIE);
+	 }
+	 leaveLowPowerMode();
+}
+
 bool COBDSPI::xbBegin(unsigned long baudrate)
 {
 	char buf[16];
-	sprintf(buf, "ATBR1%lu\r", baudrate);
+	sprintf_P(buf, PSTR("ATBR1%lu\r"), baudrate);
 	setTarget(TARGET_OBD);
 	if (sendCommand(buf, buf, sizeof(buf))) {
-		//xbPurge();
+		xbPurge();
 		return true;
 	} else {
 		return false;
@@ -663,95 +719,4 @@ void COBDSPI::xbPurge()
 	char buf[16];
 	setTarget(TARGET_OBD);
 	sendCommand("ATCLRGSM\r", buf, sizeof(buf));
-}
-
-bool COBDSPI::memsInit()
-{
-	// default at power-up:
-	//    Gyro at 250 degrees second
-	//    Acceleration at 2g
-	//    Clock source at internal 8MHz
-	//    The device is in sleep mode.
-	//
-	uint8_t c;
-	bool success;
-	success = MPU6050_read (MPU6050_WHO_AM_I, &c, 1);
-	if (!success) return false;
-
-	// According to the datasheet, the 'sleep' bit
-	// should read a '1'. But I read a '0'.
-	// That bit has to be cleared, since the sensor
-	// is in sleep mode at power-up. Even if the
-	// bit reads '0'.
-	success = MPU6050_read (MPU6050_PWR_MGMT_2, &c, 1);
-	if (!success) return false;
-
-	// Clear the 'sleep' bit to start the sensor.
-	MPU6050_write_reg (MPU6050_PWR_MGMT_1, 0);
-	return true;
-}
-
-bool COBDSPI::memsRead(MEMS_DATA* accel_t_gyro)
-{
-	bool success;
-
-	// Read the raw values.
-	// Read 14 bytes at once,
-	// containing acceleration, temperature and gyro.
-	// With the default settings of the MPU-6050,
-	// there is no filter enabled, and the values
-	// are not very stable.
-	success = MPU6050_read (MPU6050_ACCEL_XOUT_H, (uint8_t *)accel_t_gyro, sizeof(MEMS_DATA));
-	if (!success) return false;;
-
-	// Swap all high and low bytes.
-	// After this, the registers values are swapped,
-	// so the structure name like x_accel_l does no
-	// longer contain the lower byte.
-	uint8_t swap;
-	#define SWAP(x,y) swap = x; x = y; y = swap
-
-	SWAP (accel_t_gyro->reg.x_accel_h, accel_t_gyro->reg.x_accel_l);
-	SWAP (accel_t_gyro->reg.y_accel_h, accel_t_gyro->reg.y_accel_l);
-	SWAP (accel_t_gyro->reg.z_accel_h, accel_t_gyro->reg.z_accel_l);
-	SWAP (accel_t_gyro->reg.t_h, accel_t_gyro->reg.t_l);
-	SWAP (accel_t_gyro->reg.x_gyro_h, accel_t_gyro->reg.x_gyro_l);
-	SWAP (accel_t_gyro->reg.y_gyro_h, accel_t_gyro->reg.y_gyro_l);
-	SWAP (accel_t_gyro->reg.z_gyro_h, accel_t_gyro->reg.z_gyro_l);
-	return true;
-}
-
-bool COBDSPI::MPU6050_read(int start, uint8_t *buffer, int size)
-{
-	int i, n;
-
-	Wire.beginTransmission(MPU6050_I2C_ADDRESS);
-	Wire.write(start);
-	Wire.endTransmission(false);    // hold the I2C-bus
-
-	// Third parameter is true: relase I2C-bus after data is read.
-	Wire.requestFrom(MPU6050_I2C_ADDRESS, size, true);
-	while(Wire.available() && i<size)
-	{
-		buffer[i++]=Wire.read();
-	}
-	return i == size;
-}
-
-
-bool COBDSPI::MPU6050_write(int start, const uint8_t *pData, int size)
-{
-	int n;
-
-	Wire.beginTransmission(MPU6050_I2C_ADDRESS);
-	Wire.write(start);        // write the start address
-	n = Wire.write(pData, size);  // write data bytes
-	if (n != size) return false;
-	Wire.endTransmission(true); // release the I2C-bus
-	return true;
-}
-
-bool COBDSPI::MPU6050_write_reg(int reg, uint8_t data)
-{
-	return MPU6050_write(reg, &data, 1);
 }
